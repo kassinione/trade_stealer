@@ -7,8 +7,8 @@ import pyautogui
 import time
 import threading
 
-INTERVAL    = 10  # Интервал нажатия кнопки обновления
-PRICE_SHIFT = 0.1 # 
+REFREASH_INTERVAL = 10  # Интервал нажатия кнопки обновления в секундах
+PRICE_SHIFT       = 0.1 # Минимальная разница между запросом и предложением ( < p2 - p1 )
 
 def get_region(img):
     # Полноэкранное окно для точного выбора
