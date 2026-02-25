@@ -1,195 +1,125 @@
-#!/usr/bin/env python3
-"""Screen price monitor.
-
-Раз в секунду:
-1) Ищет блок "Запросов на покупку ..." и вытаскивает цену справа -> p1
-2) Ищет список с кнопками "КУПИТЬ" и вытаскивает самую верхнюю цену слева -> p2
-
-Требует локально установленные:
-- tesseract-ocr
-- python: mss opencv-python pytesseract numpy
-"""
-
-from __future__ import annotations
-
 import re
-import time
-from dataclasses import dataclass
-from typing import Optional
-
-import cv2
 import mss
+import cv2
 import numpy as np
 import pytesseract
+import pyautogui
+import time
+import threading
 
-PRICE_RE = re.compile(r"(\d+[\.,]\d{2})\s*G", re.IGNORECASE)
+INTERVAL    = 10  # Интервал нажатия кнопки обновления
+PRICE_SHIFT = 0.1 # 
 
+def get_region(img):
+    # Полноэкранное окно для точного выбора
+    cv2.namedWindow("Выделите область", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("Выделите область", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-@dataclass
-class OcrWord:
-    text: str
-    left: int
-    top: int
-    width: int
-    height: int
-    conf: float
+    r = cv2.selectROI("Выделите область", img, showCrosshair=True, fromCenter=False)
+    cv2.destroyAllWindows()
 
+    x, y, w, h = r
+    if w == 0 or h == 0:
+        return None
 
-class PriceMonitor:
-    def __init__(self, interval_sec: float = 1.0) -> None:
-        self.interval_sec = interval_sec
-        self.ocr_languages = "rus+eng"
+    roi_coords = {"left": int(x), "top": int(y), "width": int(w), "height": int(h)}
 
-    @staticmethod
-    def preprocess(image_bgr: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        thr = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            3,
-        )
-        return cv2.resize(thr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    return roi_coords
 
-    @staticmethod
-    def yellow_text_mask(image_bgr: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        lower = np.array([12, 80, 80], dtype=np.uint8)
-        upper = np.array([40, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.medianBlur(mask, 3)
-        return cv2.resize(mask, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+def get_click_point(img):
+    point = []
 
-    def _ocr_data(self, image: np.ndarray) -> list[OcrWord]:
-        cfg = "--oem 3 --psm 6"
-        try:
-            data = pytesseract.image_to_data(
-                image,
-                lang=self.ocr_languages,
-                config=cfg,
-                output_type=pytesseract.Output.DICT,
-            )
-        except pytesseract.TesseractError:
-            data = pytesseract.image_to_data(
-                image,
-                lang="eng",
-                config=cfg,
-                output_type=pytesseract.Output.DICT,
-            )
+    def mouse_callback(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            point.append((x, y))
 
-        words: list[OcrWord] = []
-        for i, txt in enumerate(data["text"]):
-            txt = (txt or "").strip()
-            if not txt:
-                continue
-            conf_str = data["conf"][i]
-            try:
-                conf = float(conf_str)
-            except (TypeError, ValueError):
-                conf = -1.0
-            words.append(
-                OcrWord(
-                    text=txt,
-                    left=int(data["left"][i]),
-                    top=int(data["top"][i]),
-                    width=int(data["width"][i]),
-                    height=int(data["height"][i]),
-                    conf=conf,
-                )
-            )
-        return words
+    cv2.namedWindow("Выберите точку", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("Выберите точку", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    @staticmethod
-    def parse_price(text: str) -> Optional[float]:
-        m = PRICE_RE.search(text)
-        if not m:
-            return None
-        return float(m.group(1).replace(",", "."))
+    cv2.setMouseCallback("Выберите точку", mouse_callback)
 
-    def find_p1(self, screen_bgr: np.ndarray) -> Optional[float]:
-        prep = self.preprocess(screen_bgr)
-        words = self._ocr_data(prep)
+    while True:
+        cv2.imshow("Выберите точку", img)
+        if point:
+            break
+        if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            break
 
-        # Ищем строку с "Запросов" + "покуп"
-        anchor_y = None
-        for w in words:
-            t = w.text.lower()
-            if "запрос" in t or "3anpoc" in t:
-                anchor_y = w.top
-                break
+    cv2.destroyAllWindows()
 
-        if anchor_y is None:
-            return None
+    return point[0] if point else None
 
-        # Берем правую часть той же полосы и OCR только по желтым символам
-        h, w = screen_bgr.shape[:2]
-        y1 = max(0, int(anchor_y / 2) - 25)
-        y2 = min(h, int(anchor_y / 2) + 100)
-        roi = screen_bgr[y1:y2, int(w * 0.45) : w]
-        if roi.size == 0:
-            return None
+def get_value_from_region(coords):
+    roi_coords = coords
+    
+    # Сразу получаем изображение выбранной области
+    with mss.mss() as sct:
+        roi_img = np.array(sct.grab(roi_coords))
+        roi_img = cv2.cvtColor(roi_img, cv2.COLOR_BGRA2BGR)
+    
+    if roi_img is None:
+        print("Область не выбрана")
+        exit()
 
-        mask = self.yellow_text_mask(roi)
-        cfg = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.,G"
-        try:
-            txt = pytesseract.image_to_string(mask, lang=self.ocr_languages, config=cfg)
-        except pytesseract.TesseractError:
-            txt = pytesseract.image_to_string(mask, lang="eng", config=cfg)
-        return self.parse_price(txt)
+    # Перевод в серый
+    g = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
 
-    def find_p2(self, screen_bgr: np.ndarray) -> Optional[float]:
-        prep = self.preprocess(screen_bgr)
-        words = self._ocr_data(prep)
+    # Лёгкое размытие для улучшения OCR
+    g = cv2.GaussianBlur(g, (3, 3), 0)
 
-        buy_rows = []
-        for w in words:
-            t = w.text.lower()
-            if "купит" in t or "kynut" in t or "kупит" in t:
-                buy_rows.append(w)
+    # Увеличение
+    g = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
-        if not buy_rows:
-            return None
+    # OCR: только цифры и точка
+    cfg = "--psm 8 -c tessedit_char_whitelist=0123456789."
+    txt = pytesseract.image_to_string(g, config=cfg)
 
-        top_buy = min(buy_rows, key=lambda x: x.top)
+    m = re.search(r"\d+\.\d+", txt)
+    val = float(m.group()) if m else None
+    
+    return val
 
-        # В исходных координатах OCR выполнялся на изображении x2, поэтому делим на 2
-        y_center = max(0, int((top_buy.top + top_buy.height // 2) / 2))
-        h, w = screen_bgr.shape[:2]
-        y1 = max(0, y_center - 45)
-        y2 = min(h, y_center + 45)
-        x2 = max(1, int((top_buy.left - 20) / 2))
-        roi = screen_bgr[y1:y2, 0:x2]
-        if roi.size == 0:
-            return None
+def click_at(x, y):
+    pyautogui.click(x, y)
 
-        mask = self.yellow_text_mask(roi)
-        cfg = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.,G"
-        txt = pytesseract.image_to_string(mask, lang="eng", config=cfg)
-        return self.parse_price(txt)
+def refreash_clicker(point):
+    """Функция, которая просто кликает раз в 10 секунд в фоне"""
+    while True:
+        print("[ФОН] Нажатие кнопки...")
+        click_at(point)
+        time.sleep(INTERVAL)
 
-    def grab_screen(self) -> np.ndarray:
-        with mss.mss() as sct:
-            shot = np.array(sct.grab(sct.monitors[1]))
-        return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+def check_counters(p1_region, p2_region):
+    """Основная логика слежки за счетчиками"""
+    p1 = 0
+    p2 = 0
+    
+    print("Программа запущена. Слежу за счетчиками...")
+    
+    while True:
+        # 1. Получаем новые значения (эмуляция)
+        new_p1 = get_value_from_region(p1_region)
+        new_p2 = get_value_from_region(p2_region)
 
-    def run(self) -> None:
-        while True:
-            p1 = None
-            p2 = None
-            try:
-                screen = self.grab_screen()
-                p1 = self.find_p1(screen)
-                p2 = self.find_p2(screen)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[warn] ошибка обработки кадра: {exc}")
-
-            print(f"p1={p1} | p2={p2}")
-            time.sleep(self.interval_sec)
-
+        # 2. Проверяем изменения
+        if new_p1 != p1:
+            print("[СОБЫТИЕ] Счетчик А изменился! Запуск проверки...")
+            
+            # Выполняем проверку и нажатие
+            # do_logic_click()
+            p1 = new_p1
+            
+        # Небольшая пауза, чтобы не нагружать процессор на 100%
+        time.sleep(0.1)
 
 if __name__ == "__main__":
-    PriceMonitor(interval_sec=1.0).run()
+    # Запускаем фоновый кликер как "демон" 
+    # (он закроется автоматически при выходе из основной программы)
+    bg_thread = threading.Thread(target=refreash_clicker, daemon=True)
+    bg_thread.start()
+
+    # Запускаем основную слежку в главном потоке
+    try:
+        check_counters()
+    except KeyboardInterrupt:
+        print("Программа остановлена.")
