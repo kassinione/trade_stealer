@@ -1,3 +1,5 @@
+import os
+import contextlib
 import re
 import mss
 import cv2
@@ -7,8 +9,11 @@ import pyautogui
 import time
 import threading
 
-REFREASH_INTERVAL = 10 
-PRICE_SHIFT = 0.1 
+REFREASH_INTERVAL = 10
+PRICE_SHIFT = 0.01
+
+# Глобальный флаг для синхронизации
+update_p2_flag = threading.Event()
 
 # Если Tesseract не в PATH, раскомментируйте строку ниже и укажите путь:
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -18,7 +23,9 @@ def get_region(img):
     cv2.setWindowProperty("Выделите область", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     r = cv2.selectROI("Выделите область", img, showCrosshair=True, fromCenter=False)
     cv2.destroyAllWindows()
+    
     x, y, w, h = r
+    
     return {"left": int(x), "top": int(y), "width": int(w), "height": int(h)} if w > 0 else None
 
 def get_click_point(img):
@@ -58,9 +65,18 @@ def refreash_clicker(point):
     while True:
         time.sleep(REFREASH_INTERVAL)
         pyautogui.click(point[0], point[1])
-        print("[ФОН] Нажата кнопка обновления")
+        pyautogui.click(point[0], point[1])
+        # print("[ФОН] Нажата кнопка обновления")
+        # ПОДНИМАЕМ ФЛАГ:
+        update_p2_flag.set()
 
-def check_counters(p1_region, p2_region):
+def check_counters(
+        p1_region, 
+        p2_region, 
+        order_point, 
+        cancel_point, 
+        input_point, 
+        confirm_point):
     # Инициализируем значения текущими данными с экрана
     with mss.mss() as sct:
         p1 = get_value_from_region(sct, p1_region) or 0.0
@@ -70,39 +86,100 @@ def check_counters(p1_region, p2_region):
         
         while True:
             new_p1 = get_value_from_region(sct, p1_region)
-            new_p2 = get_value_from_region(sct, p2_region)
-
             if new_p1 is not None and new_p1 != p1:
                 print(f"[СОБЫТИЕ] p1 изменился: {p1} -> {new_p1}")
-                # Ваша логика здесь
+                
                 if (new_p1 + PRICE_SHIFT < p2):
                     print("!!! Условие выполнено (p1 + shift < p2) !!!")
+                    pyautogui.click(order_point)
+                    pyautogui.click(input_point)
+                    pyautogui.write(str(new_p1 + PRICE_SHIFT), interval=0.1)
+                    time.sleep(0.1)  # Короткая пауза перед подтверждением
+                    pyautogui.press('enter')
+                    pyautogui.click(confirm_point)
+                    time.sleep(10)
+                    pyautogui.click(cancel_point)
                 p1 = new_p1
 
-            if new_p2 is not None and new_p2 != p2:
-                print(f"[СОБЫТИЕ] p2 изменился: {p2} -> {new_p2}")
-                p2 = new_p2
+            if update_p2_flag.is_set():
+                # Небольшая задержка, чтобы сайт успел загрузить новые данные после клика
+                time.sleep(1) 
+                
+                new_p2 = get_value_from_region(sct, p2_region)
+                if new_p2 is not None and new_p2 != p2:
+                    print(f"[СОБЫТИЕ] p2 изменился: {p2} -> {new_p2}")
+                    p2 = new_p2
+                
+                # СБРАСЫВАЕМ ФЛАГ, чтобы не обновлять p2 до следующего клика
+                update_p2_flag.clear()
 
             time.sleep(0.5) # Пауза между проверками
 
 if __name__ == "__main__":
+    # 1. Выводим единую инструкцию
+    print("\n" + "="*60)
+    print("ПОСЛЕДОВАТЕЛЬНОСТЬ ВЫДЕЛЕНИЯ (запомните или смотрите на скриншот):")
+    print("-" * 60)
+    print("ЭТАП 1:")
+    print("  1. Область значнеия запроса на покупку (без G)")
+    print("  2. Область значния предложения на покупку (без G)")
+    print("  3. Точка кнопки 'ЗАКАЗАТЬ' (в списке)")
+    print("  4. Точка кнопки 'ОТМЕНА'")
+    print("  5. Точка кнопки 'Только мои запросы' (обновление страницы)")
+    print("-" * 60)
+    print("ЭТАП 2 (Окно покупки — после нажатия Enter):")
+    print("  6. Точка ПОЛЯ ВВОДА цены")
+    print("  7. Точка кнопки 'ЗАКАЗАТЬ'")
+    print("="*60)
+    
+    print("\nПодготовьте окна, затем откройте скриншот. Скриншот будет сделан через 3 секунд...\n")
+    time.sleep(3) # Даем время развернуть терминал, чтобы он попал в кадр
+
+    # --- ЭТАП 1 ---
     with mss.mss() as sct:
         monitor = sct.monitors[1] 
         sct_img = sct.grab(monitor)
         img = np.array(sct_img)[:, :, :3]
     
-    p1_regn = get_region(img)
-    p2_regn = get_region(img)
-    refr_point = get_click_point(img)
+    # Последовательный вызов без лишних принтов, чтобы не забивать консоль
+    p1_rgn       = get_region(img)
+    p2_rgn       = get_region(img)
+    order_pnt    = get_click_point(img)
+    cancel_pnt   = get_click_point(img)
+    refreash_pnt = get_click_point(img)
 
-    if p1_regn and p2_regn and refr_point:
-        # ИСПРАВЛЕНО: передаем функцию и аргументы раздельно
-        bg_thread = threading.Thread(target=refreash_clicker, args=(refr_point,), daemon=True)
+    # --- ПЕРЕХОД ---
+    print("\n>>> Откройте окно покупки на экране и нажмите ENTER в терминале...")
+    input()
+
+    # --- ЭТАП 2 ---
+    with mss.mss() as sct:
+        sct_img = sct.grab(monitor)
+        img = np.array(sct_img)[:, :, :3]
+
+    input_pnt    = get_click_point(img)
+    confirm_pnt  = get_click_point(img)
+
+    print("\n[СОБЫТИЕ] Настройка завершена. Скрипт запущен. Закройте окно запроса. Не трогайте мышь и окно эмулятора\n")
+
+    # Проверяем, что все 7 элементов настроены
+    if all([p1_rgn, p2_rgn, order_pnt, cancel_pnt, refreash_pnt, input_pnt, confirm_pnt]):
+        
+        # Фоновый поток для обновления (рефреша)
+        bg_thread = threading.Thread(target=refreash_clicker, args=(refreash_pnt,), daemon=True)
         bg_thread.start()
 
         try:
-            check_counters(p1_regn, p2_regn)
+            # ПЕРЕДАЕМ ВСЕ ПЕРЕМЕННЫЕ В ФУНКЦИЮ
+            check_counters(
+                p1_rgn, 
+                p2_rgn, 
+                order_pnt, 
+                cancel_pnt, 
+                input_pnt, 
+                confirm_pnt
+            )
         except KeyboardInterrupt:
-            print("Программа остановлена.")
+            print("\nПрограмма остановлена пользователем.")
     else:
-        print("Настройка отменена или не завершена.")
+        print("\n[ОШИБКА] Настройка не завершена. Не все области/точки выбраны.")
