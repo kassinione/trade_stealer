@@ -1,3 +1,4 @@
+# --- БИБЛИОТЕКИ ---
 from typing import Dict, Tuple, Optional, List, Any
 import numpy as np
 import pytesseract
@@ -12,12 +13,16 @@ import cv2
 import re
 
 # --- КОНФИГУРАЦИЯ ---
-REFREASH_INTERVAL: int = 2
-MIN_PRICE_GAP: float = 0.12
-PRISE_INCREMENT: float = 0.02
+REFREASH_INTERVAL:  int = 5
+OCR_MAX_EMPTY_TIME: int = 10
+
+PRICE_INCREMENT: float = 0.02  # На сколько перебиваем конкурента (p1)
+MARKET_FEE:      float = 0.20  # Комиссия рынка (20%)
+MIN_PROFIT:      float = 0.02  # Минимальный желаемый профит
+
 LOG_FILE: str = "debug.log"
 
-# Настройка логирования
+# --- СКРИПТ ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -27,12 +32,14 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("TradeBot")
-# Глобальный флаг для синхронизации
+
 update_p2_flag = threading.Event()
-# Глобальный флаг разрешающий обновление
-refresh_allowed = threading.Event()
-refresh_allowed.set() 
+
+refreash_allowed = threading.Event()
+refreash_allowed.set() 
+
 stop_flag = threading.Event()
+
 mouse_lock = threading.Lock()
 
 Region = Dict[str, int]
@@ -42,8 +49,8 @@ def stop():
     logger.info("SYSTEM: Stop hotkey pressed. Shutting down...")
     stop_flag.set()
 
+# Выбор области на экране через OpenCV ROI.
 def get_region(img: np.ndarray) -> Optional[Region]:
-    """Выбор области на экране через OpenCV ROI."""
     window_name = "Selection: Draw Rectangle and Press SPACE/ENTER"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -58,8 +65,8 @@ def get_region(img: np.ndarray) -> Optional[Region]:
     
     return None
 
+# Выбор точки клика на экране.
 def get_click_point(img: np.ndarray) -> Optional[Point]:
-    """Выбор точки клика на экране."""
     point: List[Point] = []
     window_name = "Selection: Click Point and Press ESC"
 
@@ -80,27 +87,52 @@ def get_click_point(img: np.ndarray) -> Optional[Point]:
 
     return point[0] if point else None
 
+# Захват области и распознавание числа (OCR) с двойной проверкой.
 def get_value_from_region(sct: mss.mss, coords: Region, retry: bool = True) -> Optional[float]:
-    """Захват области и распознавание числа (OCR) с двойной проверкой."""
-    
     def read_once() -> Optional[float]:
         try:
             sct_img = sct.grab(coords)
-            roi_img = np.array(sct_img)
+            # Конвертируем в формат OpenCV
+            img = np.array(sct_img)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-            gray = cv2.cvtColor(roi_img, cv2.COLOR_BGRA2GRAY)
-            _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+            # 1. Увеличиваем изображение в 3 раза (интерполяция CUBIC лучше всего для текста)
+            img = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 
+            # 2. Переводим в ЧБ
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # 3. Убираем шумы (размытие)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+            # 4. Метод Оцу: автоматически подбирает порог
+            # Если текст светлее фона, используем THRESH_BINARY_INV (делаем текст черным на белом)
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+            # 5. Добавляем пустую белую рамку (Padding) — это ОЧЕНЬ помогает Tesseract
+            border_size = 10
+            thresh = cv2.copyMakeBorder(
+                thresh, 
+                top=border_size, bottom=border_size, 
+                left=border_size, right=border_size, 
+                borderType=cv2.BORDER_CONSTANT, 
+                value=[255, 255, 255]
+            )
+
+            # Настройка OCR
+            # psm 7 — одна строка, psm 6 — единый блок текста
             cfg = "--psm 7 -c tessedit_char_whitelist=0123456789."
             txt = pytesseract.image_to_string(thresh, config=cfg)
 
+            # Чистим результат от лишних пробелов/символов
+            txt = txt.strip().replace(" ", "")
+            
             m = re.search(r"\d+(\.\d+)?", txt)
             if m:
                 return float(m.group())
 
         except Exception as e:
-            logger.error(f"OCR_ERROR: Failed to read region {coords}. Details: {e}")
-
+            logger.error(f"OCR_ERROR: {e}")
         return None
 
     v1 = read_once()
@@ -110,7 +142,6 @@ def get_value_from_region(sct: mss.mss, coords: Region, retry: bool = True) -> O
         # logger.debug(f"OCR_READ: Confirmed value {v2}")
         return v2
 
-    # если значения не совпали — одна повторная попытка
     if retry:
         logger.debug("OCR_RETRY: values mismatch, retrying...")
         return get_value_from_region(sct, coords, retry=False)
@@ -118,43 +149,66 @@ def get_value_from_region(sct: mss.mss, coords: Region, retry: bool = True) -> O
     logger.debug("OCR_FAIL: unable to confirm value")
     return None
 
+# Фоновый поток для циклического обновления страницы.
 def refreash_clicker(point: Point) -> None:
-    """Фоновый поток для циклического обновления страницы."""
-    # logger.info(f"THREAD_START: Refresh clicker active on point {point}")
+    # logger.info(f"THREAD_START: Refreash clicker active on point {point}")
     
     while not stop_flag.is_set():
-        # logger.debug("SIGNAL: Refresh triggered")
-
-        # ждём пока refresh снова разрешат
-        refresh_allowed.wait()
+        # logger.debug("SIGNAL: Refreash triggered")
+        
+        refreash_allowed.wait() # ждём пока refreash снова разрешат
         time.sleep(0.1)
 
         with mouse_lock:
-            if not refresh_allowed.is_set(): # Доп. проверка внутри блокировки
-                continue
+            if not refreash_allowed.is_set(): continue
 
-            pyautogui.click(point[0], point[1], clicks=2, interval=0.2, duration=0.05)
+            pyautogui.click(point[0], point[1], clicks=2, interval=0.2)
             update_p2_flag.set()
 
         time.sleep(REFREASH_INTERVAL)
 
 def check_counters(
-        p1_region: Region, 
-        p2_region: Region, 
-        order_point: Point, 
-        cancel_point: Point, 
-        input_point: Point, 
-        confirm_point: Point) -> None:
-    """Основной цикл мониторинга и принятия решений."""
+        p1_region:      Region, 
+        p2_region:      Region, 
+        order_point:    Point, 
+        cancel_point:   Point, 
+        input_point:    Point, 
+        refreash_point: Point,
+        confirm_point:  Point,
+        x_point:        Point
+        ) -> None:
     
+    # Основной цикл мониторинга и принятия решений.
     with mss.mss() as sct:
         p1: float = get_value_from_region(sct, p1_region) or 0.0
         p2: float = get_value_from_region(sct, p2_region) or 0.0
         my_last_price: float = 0.0 
-        
-        logger.info(f"MONITOR_START: Initial states [p1: {p1}, p2: {p2}]")
+        last_p2_success_time = time.time()
+        tried_fix_refreash = False
+
+        logger.info(f"SYSTEM: Monitoring starts.")
         
         while not stop_flag.is_set():
+            current_time = time.time()
+            time_since_last_p2 = current_time - last_p2_success_time
+
+            # Если P2 долго не читается — попытка исправить, если не помогло — аварийный выход
+            if time_since_last_p2 > OCR_MAX_EMPTY_TIME:
+            
+                if not tried_fix_refreash:
+                    with mouse_lock:
+                        pyautogui.click(refreash_point)
+                        time.sleep(1.0)
+                        logger.critical("RECOVERY: Попытка исправить кнопку обновления")
+                    tried_fix_refreash = True
+                    last_p2_success_time = time.time() - (OCR_MAX_EMPTY_TIME / 2)
+                    continue
+
+                else:
+                    logger.critical("FATAL: Область P2 пуста или не читается слишком долго!")
+                    stop_flag.set()
+                    break
+
             new_p1 = get_value_from_region(sct, p1_region)
             
             if new_p1 is not None and new_p1 != p1:
@@ -163,16 +217,18 @@ def check_counters(
                     # logger.debug(f"SKIP: Detected own price {new_p1}. Ignoring.")
                     p1 = new_p1
                     continue
-
-                # logger.info(f"EVENT: p1 price change detected [{p1} -> {new_p1}]")
+                
+                max_allowed_price = round(p2 * (1 - MARKET_FEE) - MIN_PROFIT, 2)
+                target_price = round(new_p1 + PRICE_INCREMENT, 2)
+                # logger.debug(f"CHECK: Target: {target_price} | Max Allowed: {max_allowed_price}")
                 
                 # Условие для создания запроса
-                if (new_p1 + MIN_PRICE_GAP < p2):
+                if target_price <= max_allowed_price:
+                    refreash_allowed.clear()   # остановить обновление
 
-                    refresh_allowed.clear()   # остановить обновление
-
-                    target_price = round(new_p1 + PRISE_INCREMENT, 2)
-                    # logger.warning(f"ACTION: Outbidding! Target: {target_price} | Gap: {round(p2 - target_price, 2)}")
+                    actual_profit = round((p2 * (1 - MARKET_FEE)) - target_price, 2)
+        
+                    logger.warning(f"ACTION: Выгодно! Наша цена: {target_price} <= Порог: {max_allowed_price} при предложении: {p2} | Профит: {actual_profit}")
                     
                     with mouse_lock:
                         try:
@@ -196,17 +252,20 @@ def check_counters(
                             logger.error(f"RUNTIME_ERROR: Action sequence failed: {e}")
 
                         finally:
-                            refresh_allowed.set()   # снова включить refresh
+                            time.sleep(0.1)
+                            refreash_allowed.set()   # снова включить refreash
                 
                 p1 = new_p1
 
             # Обновление p2 (цены предложения) по флагу из потока рефреша
             if update_p2_flag.is_set():
-                time.sleep(1.2) # Задержка для загрузки станицы
+                time.sleep(1.2)    # Задержка для загрузки станицы
                 new_p2 = get_value_from_region(sct, p2_region)
                 
-                if new_p2 is not None and new_p2 != p2 and new_p2:
+                if new_p2 is not None:
                     p2 = new_p2
+                    last_p2_success_time = time.time()
+                    tried_fix_refreash = False
                     # logger.info(f"SYNC: Base price p2 updated to {p2}")
                 
                 update_p2_flag.clear()
@@ -227,14 +286,15 @@ if __name__ == "__main__":
     print("║ " + "-"*56 + " ║")
     print("║ [🔲] 1. Область ЦЕНЫ ЗАПРОСА (рамка без значка 'G')      ║")
     print("║ [🔲] 2. Область ЦЕНЫ ПРЕДЛОЖЕНИЯ (рамка без значка 'G')  ║")
-    print("║ [🎯] 3. Кнопка 'ЗАКАЗАТЬ' (в общем списке)               ║")
-    print("║ [🎯] 4. Кнопка 'ОТМЕНА' (для сброса окон)                ║")
-    print("║ [🎯] 5. Кнопка 'ТОЛЬКО МОИ ЗАПРОСЫ' (для обновления)     ║")
+    print("║ [🎯] 3. Кнопка 'ЗАКАЗАТЬ' (центр кнопки)                 ║")
+    print("║ [🎯] 4. Кнопка 'ОТМЕНА' (центр под кнопкой ЗАКАЗАТЬ)     ║")
+    print("║ [🎯] 5. Кнопка 'ТОЛЬКО МОИ ЗАПРОСЫ' (центр кнопки)       ║")
     print("║" + " "*58 + "║")
     print("║ " + "ЭТАП 2: ОКНО ЗАКАЗА (после нажатия Enter в консоли)" + " " * 6 + "║")
     print("║ " + "-"*56 + " ║")
-    print("║ [🎯] 6. ПОЛЕ ВВОДА цены (клик в центр поля)              ║")
-    print("║ [🎯] 7. Кнопка 'ЗАКАЗАТЬ' (финальное подтверждение)      ║")
+    print("║ [🎯] 6. ПОЛЕ ВВОДА цены (центр поля)                      ║")
+    print("║ [🎯] 7. Кнопка 'ЗАКАЗАТЬ' (центр кнопки)                  ║")
+    print("║ [🎯] 8. Кнопка закрытия окна 'X' (правый верхний угол)    ║")
     print("╚" + "═"*58 + "╝")
     
     print("\n[!] ПОДГОТОВКА: Разверните игру и терминал.")
@@ -249,7 +309,7 @@ if __name__ == "__main__":
         img = np.array(sct_img)[:, :, :3]
     
     try:
-        # Последовательный вызов без лишних принтов, чтобы не забивать консоль
+
         p1_rgn       = get_region(img)
         p2_rgn       = get_region(img)
         order_pnt    = get_click_point(img)
@@ -267,20 +327,21 @@ if __name__ == "__main__":
 
         input_pnt    = get_click_point(img)
         confirm_pnt  = get_click_point(img)
+        x_pnt        = get_click_point(img)
 
-        print("[!] Настройка завершена. Скрипт будет запущен после нажатия ENTER в терминале.")
-        print("[!] Закройте окно заказа и не перемещайте окно эмулятора")
-        input()
-        print("[!] Для остановки скрипта нажмите F8")
+        print("[!] Настройка завершена. Скрипт будет запущен через 3 секунды...")
+        print("[!] Не перемещайте окно эмулятора.")
+        print("[!] Для остановки скрипта нажмите F8.")
 
-        # Проверяем, что все 7 элементов настроены
-        if all([p1_rgn, p2_rgn, order_pnt, cancel_pnt, refreash_pnt, input_pnt, confirm_pnt]):
+        if all([p1_rgn, p2_rgn, order_pnt, cancel_pnt, refreash_pnt, input_pnt, confirm_pnt, x_pnt]):
                 # logger.info("SYSTEM: Configuration complete. Starting threads...")
                 
+                pyautogui.click(x_pnt)
+
                 bg_thread = threading.Thread(target=refreash_clicker, args=(refreash_pnt,), daemon=True)
                 bg_thread.start()
-
-                check_counters(p1_rgn, p2_rgn, order_pnt, cancel_pnt, input_pnt, confirm_pnt)
+                
+                check_counters(p1_rgn, p2_rgn, order_pnt, cancel_pnt, input_pnt, refreash_pnt, confirm_pnt, x_pnt)
         else:
             logger.critical("SYSTEM: Configuration failed. Not all points/regions were selected.")
             
