@@ -13,14 +13,15 @@ import cv2
 import re
 
 # --- КОНФИГУРАЦИЯ ---
+STOP_BIND: str = "f8"
+LOG_FILE:  str = "debug.log"
+
 REFREASH_INTERVAL:  int = 5
 OCR_MAX_EMPTY_TIME: int = 10
 
 PRICE_INCREMENT: float = 0.02  # На сколько перебиваем конкурента (p1)
 MARKET_FEE:      float = 0.20  # Комиссия рынка (20%)
 MIN_PROFIT:      float = 0.02  # Минимальный желаемый профит
-
-LOG_FILE: str = "debug.log"
 
 # --- СКРИПТ ---
 logging.basicConfig(
@@ -277,7 +278,7 @@ def check_counters(
 
 if __name__ == "__main__":
 
-    keyboard.add_hotkey("f8", stop)
+    keyboard.add_hotkey(STOP_BIND, stop)
 
     print("\n" + "╔" + "═"*58 + "╗")
     print("║" + " "*17 + "ИНСТРУКЦИЯ ПО НАСТРОЙКЕ СКРИПТА" + " "*10 + "║")
