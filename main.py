@@ -16,9 +16,8 @@ import re
 REFREASH_INTERVAL:  int = 5
 OCR_MAX_EMPTY_TIME: int = 10
 
-PRICE_INCREMENT: float = 0.02  # На сколько перебиваем конкурента (p1)
-MARKET_FEE:      float = 0.20  # Комиссия рынка (20%)
-MIN_PROFIT:      float = 0.02  # Минимальный желаемый профит
+PRICE_INCREMENT: float = 0.10  # На сколько перебиваем конкурента (p1)
+MIN_PRICE_GAP:   float = 0.10  # Минимальная разница между запросом и предложением
 
 LOG_FILE: str = "debug.log"
 
@@ -218,17 +217,15 @@ def check_counters(
                     p1 = new_p1
                     continue
                 
-                max_allowed_price = round(p2 * (1 - MARKET_FEE) - MIN_PROFIT, 2)
-                target_price = round(new_p1 + PRICE_INCREMENT, 2)
                 # logger.debug(f"CHECK: Target: {target_price} | Max Allowed: {max_allowed_price}")
                 
-                # Условие для создания запроса
-                if target_price <= max_allowed_price:
-                    refreash_allowed.clear()   # остановить обновление
+                target_price = new_p1 + PRICE_INCREMENT
 
-                    actual_profit = round((p2 * (1 - MARKET_FEE)) - target_price, 2)
+                # Условие для создания запроса
+                if (p2 - target_price > MIN_PRICE_GAP):
+                    refreash_allowed.clear()   # остановить обновление
         
-                    logger.warning(f"ACTION: Выгодно! Наша цена: {target_price} <= Порог: {max_allowed_price} при предложении: {p2} | Профит: {actual_profit}")
+                    logger.warning(f"ACTION: Создаем заказ. Наша цена: {target_price} < Предложение: {p2}")
                     
                     with mouse_lock:
                         try:
