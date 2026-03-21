@@ -16,7 +16,7 @@ import re
 STOP_BIND: str = "f8"
 LOG_FILE:  str = "debug.log"
 
-REFREASH_INTERVAL:  int = 5
+REFREASH_INTERVAL:  int = 15
 OCR_MAX_EMPTY_TIME: int = 10
 
 PRICE_INCREMENT: float = 0.10  # На сколько перебиваем конкурента (p1)
@@ -234,7 +234,8 @@ def check_counters(
                             time.sleep(0.1)
                             pyautogui.click(input_point)
                             
-                            pyautogui.write(str(target_price), interval=0.05)
+                            formatted_price = f"{target_price:.2f}"
+                            pyautogui.write(formatted_price, interval=0.05)
                             time.sleep(0.1)
                             pyautogui.press('enter')
                             
