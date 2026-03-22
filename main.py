@@ -1,5 +1,6 @@
 # --- БИБЛИОТЕКИ ---
 from typing import Dict, Tuple, Optional, List, Any
+from mss.base import ScreenShot
 import numpy as np
 import pytesseract
 import threading
@@ -32,18 +33,14 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("TradeBot")
-
 update_p2_flag = threading.Event()
-
 refreash_allowed = threading.Event()
 refreash_allowed.set() 
-
 stop_flag = threading.Event()
-
 mouse_lock = threading.Lock()
 
 Region = Dict[str, int]
-Point = Tuple[int, int]
+Point  = Tuple[int, int]
 
 def stop():
     logger.info("SYSTEM: Stop hotkey pressed. Shutting down...")
@@ -87,13 +84,25 @@ def get_click_point(img: np.ndarray) -> Optional[Point]:
 
     return point[0] if point else None
 
+def get_sct_image(sct: mss.mss, coords: Region) -> ScreenShot:
+    return sct.grab(coords)
+
+def sct_to_np(sct_img: ScreenShot) -> np.ndarray:
+    return np.frombuffer(sct_img.raw, dtype=np.uint8).reshape(
+        (sct_img.height, sct_img.width, 4)
+    )
+
+def images_equal(img1: np.ndarray, img2: np.ndarray, threshold: float = 0.0) -> bool:
+    if img1.shape != img2.shape:
+        return False
+    
+    diff = np.mean(cv2.absdiff(img1, img2))
+    return diff <= threshold
+
 # Захват области и распознавание числа (OCR) с двойной проверкой.
-def get_value_from_region(sct: mss.mss, coords: Region, retry: bool = True) -> Optional[float]:
+def get_value_from_np(img: np.ndarray) -> Optional[float]:
     def read_once() -> Optional[float]:
         try:
-            sct_img = sct.grab(coords)
-            # Конвертируем в формат OpenCV
-            img = np.array(sct_img)
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
             # 1. Увеличиваем изображение в 3 раза (интерполяция CUBIC лучше всего для текста)
@@ -133,18 +142,13 @@ def get_value_from_region(sct: mss.mss, coords: Region, retry: bool = True) -> O
 
         except Exception as e:
             logger.error(f"OCR_ERROR: {e}")
+
         return None
 
-    v1 = read_once()
-    v2 = read_once()
+    value = read_once()
 
-    if v1 is not None and v2 is not None and abs(v1 - v2) < 0.01:
-        # logger.debug(f"OCR_READ: Confirmed value {v2}")
-        return v2
-
-    if retry:
-        logger.debug("OCR_RETRY: values mismatch, retrying...")
-        return get_value_from_region(sct, coords, retry=False)
+    if value is not None :
+        return value
 
     logger.debug("OCR_FAIL: unable to confirm value")
     return None
@@ -180,11 +184,16 @@ def check_counters(
     
     # Основной цикл мониторинга и принятия решений.
     with mss.mss() as sct:
-        p1: float = get_value_from_region(sct, p1_region) or 0.0
-        p2: float = get_value_from_region(sct, p2_region) or 0.0
+        img_p1 : np.ndarray = sct_to_np(get_sct_image(sct, p1_region))
+        img_p2 : np.ndarray = sct_to_np(get_sct_image(sct, p2_region))
+        
+        p1: float = get_value_from_np(img_p1) or 0.0
+        p2: float = get_value_from_np(img_p2) or 0.0
+        
         my_last_price: float = 0.0 
-        last_p2_success_time = time.time()
-        # tried_fix_refreash = False
+        last_p2_success_time : time = time.time()
+
+        new_p1 : np.ndarray = None
 
         logger.info(f"SYSTEM: Monitoring starts.")
         
@@ -194,23 +203,17 @@ def check_counters(
 
             # Если P2 долго не читается — попытка исправить, если не помогло — аварийный выход
             if time_since_last_p2 > OCR_MAX_EMPTY_TIME:
-            
-                # if not tried_fix_refreash:
-                #     with mouse_lock:
-                #         pyautogui.click(refreash_point)
-                #         time.sleep(1.0)
-                #         logger.critical("RECOVERY: Попытка исправить кнопку обновления")
-                #     tried_fix_refreash = True
-                #     last_p2_success_time = time.time() - (OCR_MAX_EMPTY_TIME / 2)
-                #     continue
-
-                # else:
                 logger.critical("FATAL: Область P2 пуста или не читается слишком долго!")
                 stop_flag.set()
                 break
-
-            new_p1 = get_value_from_region(sct, p1_region)
             
+            new_img_p1 = sct_to_np(get_sct_image(sct, p1_region))
+            
+            if not images_equal(new_img_p1, img_p1, 2) : # нужен разбор сравнения, может усложнится из за сравнения сырых изображений 
+                new_p1 = get_value_from_np(new_img_p1)
+            
+            # требуется доработка 
+
             if new_p1 is not None and new_p1 != p1:
                 # Защита от самоперебивания
                 if abs(new_p1 - my_last_price) < 0.01:
