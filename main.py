@@ -17,7 +17,7 @@ STOP_BIND: str = "f8"
 LOG_FILE:  str = "debug.log"
 
 REFREASH_INTERVAL:  int = 15
-OCR_MAX_EMPTY_TIME: int = 10
+# OCR_MAX_EMPTY_TIME: int = 10
 
 PRICE_INCREMENT: float = 0.10  # На сколько перебиваем конкурента (p1)
 MIN_PRICE_GAP:   float = 0.10  # Минимальная разница между запросом и предложением
@@ -183,31 +183,20 @@ def check_counters(
         p1: float = get_value_from_region(sct, p1_region) or 0.0
         p2: float = get_value_from_region(sct, p2_region) or 0.0
         my_last_price: float = 0.0 
-        last_p2_success_time = time.time()
-        # tried_fix_refreash = False
+        # last_p2_success_time = time.time()
 
         logger.info(f"SYSTEM: Monitoring starts.")
         
         while not stop_flag.is_set():
-            current_time = time.time()
-            time_since_last_p2 = current_time - last_p2_success_time
+            # current_time = time.time()
+            # time_since_last_p2 = current_time - last_p2_success_time
 
-            # Если P2 долго не читается — попытка исправить, если не помогло — аварийный выход
-            if time_since_last_p2 > OCR_MAX_EMPTY_TIME:
-            
-                # if not tried_fix_refreash:
-                #     with mouse_lock:
-                #         pyautogui.click(refreash_point)
-                #         time.sleep(1.0)
-                #         logger.critical("RECOVERY: Попытка исправить кнопку обновления")
-                #     tried_fix_refreash = True
-                #     last_p2_success_time = time.time() - (OCR_MAX_EMPTY_TIME / 2)
-                #     continue
+            # # Если P2 долго не читается — попытка исправить, если не помогло — аварийный выход
+            # if time_since_last_p2 > OCR_MAX_EMPTY_TIME:
 
-                # else:
-                logger.critical("FATAL: Область P2 пуста или не читается слишком долго!")
-                stop_flag.set()
-                break
+            #     logger.critical("FATAL: Область P2 пуста или не читается слишком долго!")
+            #     stop_flag.set()
+            #     break
 
             new_p1 = get_value_from_region(sct, p1_region)
             
@@ -263,8 +252,7 @@ def check_counters(
                 
                 if new_p2 is not None:
                     p2 = new_p2
-                    last_p2_success_time = time.time()
-                    # tried_fix_refreash = False
+                    # last_p2_success_time = time.time()
                     # logger.info(f"SYNC: Base price p2 updated to {p2}")
                 
                 update_p2_flag.clear()
